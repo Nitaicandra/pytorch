@@ -8,8 +8,11 @@ C10_API std::array<StorageImplCreateHelper, at::COMPILE_TIME_MAX_DEVICE_TYPES>
     StorageImplCreate;
 
 // A allowlist of device type, currently available is PrivateUse1.
-static ska::flat_hash_set<c10::DeviceType> DeviceTypeAllowList{
+ska::flat_hash_set<c10::DeviceType>& DeviceTypeAllowList() {
+  static ska::flat_hash_set<c10::DeviceType> deviceTypeAllowList{
     DeviceType::PrivateUse1};
+  return deviceTypeAllowList;
+}
 
 void throwNullDataPtrError() {
   TORCH_CHECK(
@@ -42,7 +45,7 @@ void SetStorageImplCreate(DeviceType t, StorageImplCreateHelper fptr) {
   // Only if the devicetype is in the allowlist,
   // we allow the extension to be registered for storageImpl create.
   TORCH_CHECK(
-      DeviceTypeAllowList.find(t) != DeviceTypeAllowList.end(),
+      DeviceTypeAllowList().find(t) != DeviceTypeAllowList().end(),
       "It is only allowed to register the storageImpl create method ",
       "for PrivateUse1. ",
       "If you have related storageImpl requirements, ",
