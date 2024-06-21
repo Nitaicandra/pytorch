@@ -3,8 +3,6 @@
 
 namespace torch::serialize {
 
-IStreamAdapter::IStreamAdapter(std::istream* istream) : istream_(istream) {}
-
 size_t IStreamAdapter::size() const {
   auto prev_pos = istream_->tellg();
   validate("getting the current position");
@@ -32,6 +30,4 @@ void IStreamAdapter::validate(const char* what) const {
   }
 }
 
-// NOLINTNEXTLINE(modernize-use-equals-default)
-IStreamAdapter::~IStreamAdapter() = default;
 } // namespace torch::serialize

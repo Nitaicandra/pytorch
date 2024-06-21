@@ -74,7 +74,5 @@ size_t FileAdapter::read(uint64_t pos, void* buf, size_t n, const char* what)
   return fread(buf, 1, n, file_.fp_);
 }
 
-FileAdapter::~FileAdapter() = default;
-
 } // namespace torch::serialize
 // namespace caffe2
