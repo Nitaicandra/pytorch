@@ -1,12 +1,14 @@
 # mypy: allow-untyped-defs
 import contextlib
+import functools
 
-from typing import Any, cast, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Callable, cast, Dict, List, NamedTuple, Optional, Set, Tuple
 
 import torch
 import torch._dynamo.compiled_autograd as ca
 import torch.distributed as dist
 import torch.nn as nn
+from torch.autograd.graph import _get_grad_fn_or_grad_acc, _MultiHandle
 from torch.distributed.fsdp._common_utils import _named_parameters_with_duplicates
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten, tree_unflatten
@@ -122,6 +124,15 @@ class FSDPParamGroup:
         # - Hook state
         self._module_to_pre_save_state_dict_hook_handle: _ModuleToHandleDict = {}
         self._module_to_pre_load_state_dict_hook_handle: _ModuleToHandleDict = {}
+        # When a module's forward inputs do not require grad, we cannot use
+        # `RegisterPostBackwardFunction` to run post-backward. The queued final
+        # callback may run post-backward too late if there is non-FSDP compute
+        # after this module's backward compute. We register a multi-grad hook
+        # on the unsharded parameters to run the post-backward earlier.
+        self._multi_grad_hook_handle: Optional[RemovableHandle] = None
+        # Guard whether to run the multi-grad hook based on whether the current
+        # forward's inputs require gradient or not
+        self._run_multi_grad_hook: bool = False
 
         # - Communication and communication/computation overlap
         self.comm_ctx = FSDPCommContext()
@@ -344,6 +355,10 @@ class FSDPParamGroup:
                 self._partial_reduce_output,
             )
 
+    def _multi_grad_post_backward(self, *args: Any, **kwargs: Any):
+        if self._run_multi_grad_hook:
+            return self.post_backward(*args, **kwargs)
+
     def finalize_backward(self):
         if self._post_reduce_event is not None:
             torch.cuda.current_stream().wait_event(self._post_reduce_event)
@@ -444,7 +459,20 @@ class FSDPParamGroup:
                 inp_tensor_indices.append(i)
                 inp_tensors.append(obj)
         if len(inp_tensors) == 0:
+            # Guard using this flag in case that whether the module inputs
+            # require grad or not is dynamic from iteration to iteration
+            self._run_multi_grad_hook = True
+            # Only need to register once since the unsharded parameter objects
+            # are preserved from iteration to iteration in eager
+            if self._multi_grad_hook_handle is None:
+                tensors = [
+                    fsdp_param.unsharded_param for fsdp_param in self.fsdp_params
+                ]
+                self._multi_grad_hook_handle = _register_multi_post_acc_grad_hook(
+                    tensors, self._multi_grad_post_backward
+                )
             return args, kwargs  # no tensors that require gradients
+        self._run_multi_grad_hook = False
         inp_tensors = RegisterPostBackwardFunction.apply(self, *inp_tensors)
         for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
             args_kwargs_list[inp_tensor_idx] = inp_tensor
@@ -556,3 +584,35 @@ class RegisterPostBackwardFunction(torch.autograd.Function):
     def backward(ctx, *grads: torch.Tensor):
         ctx.param_group.post_backward()
         return (None,) + grads
+
+
+def _register_multi_post_acc_grad_hook(
+    tensors: List[nn.Parameter], fn: Callable
+) -> RemovableHandle:
+    tensors = [t for t in tensors if t.requires_grad]
+    if not all(t.is_leaf for t in tensors):
+        raise ValueError("Requires all tensors to be leaf tensors")
+    if len(tensors) == 0:
+        return _MultiHandle(tuple())
+
+    acc_grads = [_get_grad_fn_or_grad_acc(t) for t in tensors]
+    count: Dict[int, int] = dict()
+    nb_calls = None
+
+    @functools.wraps(fn)
+    def wrapped_fn(tensor: torch.Tensor) -> None:
+        nonlocal count, nb_calls
+        id = torch._C._current_graph_task_id()
+        assert id != -1, "expected this hook to be called inside a backward call"
+        count[id] = count.get(id, 0)
+        if count[id] == 0:
+            nb_calls = sum(
+                torch._C._will_engine_execute_node(n) for n in acc_grads  # type: ignore[attr-defined]
+            )
+        count[id] += 1
+        if count[id] == nb_calls:
+            fn(tensors)
+            del count[id]
+
+    handles = tuple(t.register_post_accumulate_grad_hook(wrapped_fn) for t in tensors)
+    return _MultiHandle(handles)
