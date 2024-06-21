@@ -357,15 +357,49 @@ TCPStore::TCPStore(std::string host, const TCPStoreOptions& opts)
     // TODO (xilunwu): this wait logic may be removed after fixing read_offset
     // stagger connecting to the store when there are too many ranks to
     // avoid causing a DDoS
-    std::this_thread::sleep_for(std::chrono::milliseconds(distrib(gen)));
+    std::chrono::milliseconds jitter{distrib(gen)};
+    C10D_WARNING("sleeping for {}ms to avoid DDoS", jitter.count());
+    std::this_thread::sleep_for(jitter);
   }
 
-  client_ = detail::TCPClient::connect(addr_, opts);
-  // TCP connection established
-  C10D_DEBUG("TCP client connected to host {}:{}", addr_.host, addr_.port);
+  // Try connecting several times -- if the server listen backlog is full it may
+  // fail on the first send in validate.
+  auto deadline = std::chrono::steady_clock::now() + opts.timeout;
+  auto retry = 0;
+  do {
+    try {
+      client_ = detail::TCPClient::connect(addr_, opts);
+      // TCP connection established
+      C10D_DEBUG("TCP client connected to host {}:{}", addr_.host, addr_.port);
 
-  // client's first query for validation
-  validate();
+      // client's first query for validation
+      validate();
+
+      // success
+      break;
+    } catch (const c10::DistNetworkError& ex) {
+      if (deadline < std::chrono::steady_clock::now()) {
+        C10D_ERROR(
+            "TCP client failed to connect/validate to host {}:{} - timed out (try={}, timeout={}ms): {}",
+            addr_.host,
+            addr_.port,
+            retry,
+            opts.timeout.count(),
+            ex.what());
+        throw;
+      }
+
+      C10D_WARNING(
+          "TCP client failed to connect/validate to host {}:{} - retrying (try={}, timeout={}ms): {}",
+          addr_.host,
+          addr_.port,
+          retry,
+          opts.timeout.count(),
+          ex.what());
+      std::this_thread::sleep_for(kConnectRetryDelay);
+      retry += 1;
+    }
+  } while (true);
 
   if (opts.waitWorkers) {
     waitForWorkers();
