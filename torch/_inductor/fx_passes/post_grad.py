@@ -12,6 +12,7 @@ import torch.utils._pytree as pytree
 from torch import fx
 from torch._decomp import register_decomposition
 from torch._dynamo.utils import counters, optimus_scuba_log
+from torch._inductor.virtualized import ops
 
 from torch._prims_common import is_boolean_dtype, is_expandable_to, is_integer_dtype
 
@@ -214,6 +215,65 @@ def is_valid_mm_plus_mm(match: Match):
         return False
 
     return True
+
+
+def scatter_upon_const_tensor_extra_check(m):
+    if not config.optimize_scatter_upon_const_tensor:
+        return False
+    allzero_shape = m.kwargs["shape"]
+    selector = m.kwargs["selector"]
+    dim = m.kwargs["dim"]
+
+    selector_ft = selector.meta["val"]
+    assert selector_ft.dim() == len(allzero_shape)
+
+    # Actually we can support small size larger than 1. It would be a bit
+    # tedius. E.g., we load all the index values (not many) and compare
+    # them with the position in tensor to decide what value to return.
+    return selector_ft.size(dim) == 1
+
+
+@register_lowering_pattern(
+    CallFunction(
+        aten.scatter.value,
+        CallFunction(
+            aten.full,
+            KeywordArg("shape"),
+            KeywordArg("background_val"),
+            dtype=KeywordArg("dtype"),
+        ),
+        KeywordArg("dim"),
+        KeywordArg("selector"),
+        KeywordArg("val"),  # scalar value
+    ),
+    extra_check=scatter_upon_const_tensor_extra_check,
+)
+def scatter_upon_const_tensor(
+    match: Match, shape, background_val, dtype, dim, selector, val
+):
+    from torch._inductor import metrics
+
+    metrics.num_matches_for_scatter_upon_const_tensor += 1
+
+    selector_loader = selector.make_loader()
+
+    def inner_fn(idx):
+        selector_idx = list(idx)
+        selector_idx[dim] = 0
+
+        selector = selector_loader(selector_idx)
+        return ops.where(
+            selector == ops.index_expr(idx[dim], torch.int64),
+            ops.constant(val, dtype),
+            ops.constant(background_val, dtype),
+        )
+
+    return ir.Pointwise.create(
+        device=selector.get_device(),
+        dtype=dtype,
+        inner_fn=inner_fn,
+        ranges=shape,
+    )
 
 
 @register_lowering_pattern(
