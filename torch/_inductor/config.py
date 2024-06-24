@@ -663,6 +663,10 @@ class triton:
     # Enable cudagraph support for mutated inputs from prior cudagraph pool
     cudagraph_support_input_mutation = False
 
+    # Maximal number of allowed cudagraph re-record for a function and
+    # a cudagraph node. i.e., allow num_recording <= cudagraph_max_recording
+    cudagraph_max_recording = 5
+
     # synchronize after cudagraph invocation
     force_cudagraph_sync = False
 

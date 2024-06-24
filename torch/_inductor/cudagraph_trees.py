@@ -754,10 +754,12 @@ class CUDAGraphNode:
         self.device = device_index
         self.stack_traces = stack_traces
         self.stream = stream
-        # If we are inlining builtin nn modules we will re-record if static inputs change
-        # if not we should error because dynamo should have recompiled in this case
+
+        # Enable re-record a cudagraph when static tensor address changed.
+        # if not we should error when it changed.
         self.rerecord_if_static_inputs_change = (
             torch._dynamo.config.inline_inbuilt_nn_modules
+            or torch._inductor.config.cudagraph_support_input_mutation
         )
 
         # if this is a root parent will be None. use weakref to prevent reference cycle
@@ -1800,6 +1802,12 @@ class CUDAGraphTreeManager:
         ] = defaultdict(dict)
         self.warmup_node_counter = itertools.count(start=-1, step=-1)
 
+        # mapping from graph_id to (function id to record count). We fall back to
+        # eager function if a function is re-recorded frequently on a node.
+        self.num_record: Dict[Optional[GraphID], Dict[FunctionID, int]] = defaultdict(
+            lambda: defaultdict(lambda: 0)
+        )
+
         # whether we the current node is in a state of warmup, recording, execution. If
         # there is no current node the state will be ExecutionState.None.
         self.path_state = ExecutionState.NONE
@@ -1910,7 +1918,11 @@ class CUDAGraphTreeManager:
         # Early exit if the function mutates inputs which are neither parameters/buffers nor
         # cudagraph recorded tensors. This check should happen after `try_end_curr_recording`
         # and `try_end_curr_warmup` which may change self.current_node.
-        if self.non_cudagraph_managed_mutation_hint[node_id][function_id]:
+        if (
+            self.non_cudagraph_managed_mutation_hint[node_id][function_id]
+            or self.num_record[node_id][function_id]
+            > torch._inductor.config.triton.cudagraph_max_recording
+        ):
             return self.ids_to_funcs[function_id].model(new_inputs)
 
         # warming up a function and subsequentally recording may use different memory addresses
@@ -1997,6 +2009,20 @@ class CUDAGraphTreeManager:
         self.current_node = None
 
     def record_function(self, new_inputs, function_id) -> List[Optional[Tensor]]:
+        parent_node_id = self._get_node_id()
+        self.num_record[parent_node_id][function_id] += 1
+        if (
+            self.num_record[parent_node_id][function_id]
+            > torch._inductor.config.triton.cudagraph_max_recording
+        ):
+            _id = parent_node_id.id if parent_node_id else None
+            log_cudagraph_skip_and_bump_counter(
+                f"skipping cudagraph due to function {function_id.id} exceeding max "
+                f"recording limit (={torch._inductor.config.triton.cudagraph_max_recording}) "
+                f"on cudagraph node {_id}"
+            )
+            return self.ids_to_funcs[function_id].model(new_inputs)
+
         graph_id = self.new_graph_id()
         log.debug(
             "Recording function %d of graph recording id %d",
