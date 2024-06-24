@@ -835,7 +835,12 @@ class TestBothSerialization(TestCase):
         with AlwaysWarnTypedStorageRemoval(True), warnings.catch_warnings(record=True) as w:
             with tempfile.NamedTemporaryFile() as f_new, tempfile.NamedTemporaryFile() as f_old:
                 test(f_new, f_old)
-            self.assertTrue(len(w) == 0, msg=f"Expected no warnings but got {[str(x) for x in w]}")
+            if weights_only:
+                self.assertTrue(len(w) == 0, msg=f"Expected no warnings but got {[str(x) for x in w]}")
+            else:
+                num_warnings = 2 if torch._dynamo.is_compiling() else 1
+                self.assertTrue(len(w) == num_warnings, msg=f"Expected one warning but got {[str(x) for x in w]}")
+                self.assertEqual(w[0].category, FutureWarning)
 
 
 class TestOldSerialization(TestCase, SerializationMixin):
@@ -865,7 +870,8 @@ class TestOldSerialization(TestCase, SerializationMixin):
                 loaded = torch.load(checkpoint)
                 self.assertTrue(isinstance(loaded, module.Net))
                 if can_retrieve_source:
-                    self.assertEqual(len(w), 0)
+                    self.assertEqual(len(w), 1)
+                    self.assertEqual(w[0].category, FutureWarning)
 
             # Replace the module with different source
             fname = get_file_path_2(os.path.dirname(os.path.dirname(torch.__file__)), 'torch', 'testing',
@@ -876,8 +882,8 @@ class TestOldSerialization(TestCase, SerializationMixin):
                 loaded = torch.load(checkpoint)
                 self.assertTrue(isinstance(loaded, module.Net))
                 if can_retrieve_source:
-                    self.assertEqual(len(w), 1)
-                    self.assertTrue(w[0].category, 'SourceChangeWarning')
+                    self.assertEqual(len(w), 2)
+                    self.assertTrue(w[1].category, 'SourceChangeWarning')
 
     def test_serialization_container(self):
         self._test_serialization_container('file', tempfile.NamedTemporaryFile)
