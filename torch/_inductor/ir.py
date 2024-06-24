@@ -4840,41 +4840,6 @@ class UserDefinedTritonKernel(ExternKernel):
         return self.outputs
 
 
-def mark_node_as_mutating(cur_buffer, *mutated_nodes: IRNode):
-    """
-    Allows ops in mutated_nodes to be marked as being mutated as well as
-    indicates to the scheduler that these ops depend on cur_buffer.
-
-    NB: Use this instead of directly constructing MutationOutput
-    """
-    for node in mutated_nodes:
-        assert isinstance(
-            node, IRNode
-        ), f"{node} node is type {type(node)} and is not an IRNode"
-        MutationOperation(node.get_layout(), node, cur_buffer)
-
-
-class MutationOperation(InputsKernel):
-    # TODO: Remove this, and use MutationOutput directly
-    def __init__(self, layout, mutated_node, node_doing_mutating):
-        super().__init__(None, layout, inputs=[node_doing_mutating])
-        self.device = node_doing_mutating.get_device()
-        self.outputs: List[Buffer] = [MutationOutput(layout, mutated_node, self)]
-        V.graph.register_operation(self)
-
-    def get_device(self):
-        return self.device
-
-    def get_outputs(self) -> List[Buffer]:
-        return self.outputs
-
-    def should_allocate(self):
-        return False
-
-    def is_no_op(self):
-        return True
-
-
 class InplaceBernoulliFallback(ExternKernel):
     """
     This needs to be a custom class to handle mutation properly
@@ -4911,13 +4876,13 @@ class InplaceBernoulliFallback(ExternKernel):
             constant_args,
             op_overload=op_overload,
         )
+        V.graph.mark_buffer_mutated(x.get_name())
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
         self.python_kernel_name = "aten.bernoulli_"
         if not config.abi_compatible:
             # TODO: this should be simplified once we switch to ABI-compatible only
             self.cpp_kernel_name = "at::native::bernoulli_"
-        mark_node_as_mutating(self, x)
 
 
 # Used to deal with torch.complex types
@@ -4957,6 +4922,7 @@ class InplaceCopyFallback(ExternKernel):
                 "aoti_torch_copy_" if config.abi_compatible else "at::_ops::copy_::call"
             ),
         )
+        V.graph.mark_buffer_mutated(inputs[0].get_name())
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
 
@@ -4969,7 +4935,6 @@ class InplaceCopyFallback(ExternKernel):
             inputs,
             constant_args,
         )
-        mark_node_as_mutating(result, dst)
         return result
 
 
@@ -5015,7 +4980,6 @@ class ResizeStorageBytes(MutatingFirstArgExternKernel):
         self.python_kernel_name = "inductor_ops.resize_storage_bytes_"
         self.cpp_kernel_name = "torch::inductor::resize_storage_bytes_"
         V.graph.never_reuse_buffers.add(variable.data.get_name())
-        mark_node_as_mutating(self, variable)
 
 
 class SetSourceTensorKernel(ExternKernelAlloc):
@@ -5029,16 +4993,18 @@ class SetSourceTensorKernel(ExternKernelAlloc):
         V.graph.never_reuse_buffers.add(self_tensor.data.get_name())
         V.graph.never_reuse_buffers.add(storage_tensor.get_name())
         V.graph.never_reuse_buffers.add(self.get_name())
-        mark_node_as_mutating(self, self_tensor, storage_tensor)
+        device = storage_tensor.get_device()
+        self.outputs: List[Buffer] = [
+            self,
+            MutationOutput(NoneLayout(device), self_tensor, self),
+            MutationOutput(NoneLayout(device), storage_tensor, self),
+        ]
+
+    def get_outputs(self) -> List[Buffer]:
+        return self.outputs
 
     def get_inputs_that_alias_output(self):
         return [self.inputs[0].get_name(), self.inputs[1].get_name()]
-
-    def get_mutation_names(self):
-        return [self.inputs[1].get_name()]
-
-    def has_side_effects(self):
-        return True
 
 
 class ScatterFallback(ExternKernel):
@@ -5112,9 +5078,9 @@ class ScatterFallback(ExternKernel):
             op_overload=op_overload,
         )
         self.cpp_kernel_name = get_aten_cpp_kernel_name(op_overload)
+        V.graph.mark_buffer_mutated(x.get_name())
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
-        mark_node_as_mutating(self, x)
 
 
 class IndexPutFallback(ExternKernel):
@@ -5161,9 +5127,9 @@ class IndexPutFallback(ExternKernel):
             cpp_kernel_name=cpp_kernel_name,
             op_overload=op_overload,
         )
+        V.graph.mark_buffer_mutated(self.inputs[0].get_name())
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
-        mark_node_as_mutating(self, x)
 
 
 class DeviceCopy(ExternKernelOut):
@@ -5326,6 +5292,7 @@ class FallbackKernel(ExternKernelAlloc):
         # abi-compatible mode, where we retrieve outputs by pass each individual
         # output through the abi-compatible interface.
         self.outputs: Sequence[Any] = []
+        self.mutation_outputs: List[Buffer] = []
         self.use_runtime_dispatch = False
         self.unbacked_bindings = unbacked_bindings
 
@@ -5406,10 +5373,15 @@ class FallbackKernel(ExternKernelAlloc):
             assert isinstance(info.type, torch.TensorType) or is_optional_tensor
             self.alias_names.append(arg.get_name())
             if info.alias_info.is_write:
-                mark_node_as_mutating(self, arg)
+                self.mutation_outputs.append(
+                    MutationOutput(NoneLayout(arg.get_device()), arg, self)
+                )
 
         for info, arg in torch._library.utils.zip_schema(schema, args, kwargs):
             handle_aliasing_and_mutation(info, arg)
+
+    def get_outputs(self) -> List[Buffer]:
+        return [self, *self.mutation_outputs]
 
     def codegen_unbacked_symbol_defs(self, wrapper):
         if not hasattr(self, "unbacked_bindings"):
@@ -6717,8 +6689,9 @@ class _CollectiveKernel(FallbackKernel):
         for tensor_arg in tensor_args:
             tensor_arg.realize()
 
+        device = tensor_args[0].get_device()
         packed = cls(
-            NoneLayout(tensor_args[0].get_device()),
+            NoneLayout(device),
             kernel,
             tensor_args,
             non_tensor_args,
@@ -6727,7 +6700,12 @@ class _CollectiveKernel(FallbackKernel):
         packed.cpp_kernel_name = cpp_kernel_name
         packed.python_kernel_name = python_kernel_name
 
-        mark_node_as_mutating(packed, *pytree.tree_leaves(inputs))
+        packed.mutation_outputs.extend(
+            [
+                MutationOutput(NoneLayout(device), buf, packed)
+                for buf in pytree.tree_leaves(inputs)
+            ]
+        )
 
     # NOTE: [Out-of-Place Collective Safety]
     # Between the initiation and completion of an out-of-place collective:
@@ -6843,8 +6821,9 @@ class _WaitKernel(_CollectiveKernel):
             non_tensor_args,
             unflatten_args,
         )
-
-        mark_node_as_mutating(packed, inp)
+        packed.mutation_outputs.append(
+            MutationOutput(NoneLayout(inp.get_device()), inp, packed)
+        )
 
     def get_read_writes(self):
         read_writes = super().get_read_writes()
