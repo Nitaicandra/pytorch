@@ -56,7 +56,7 @@ def create_subclass_meta(
                     arg_count=curr_cnt,
                     original_subclass=a,
                     meta=meta,
-                    inner_keys=attrs,
+                    inner_keys=list(attrs),
                     outer_size=a.shape,
                     outer_stride=a.stride(),
                 )
