@@ -16,7 +16,7 @@ import math
 import operator
 import sys
 from functools import lru_cache, update_wrapper
-from typing import Optional, Type, TYPE_CHECKING, Union
+from typing import FrozenSet, Optional, Type, TYPE_CHECKING, Union
 
 import torch
 
@@ -126,6 +126,17 @@ class SymNode:
         return SymNode(
             self._expr, shape_env, self.pytype, self._hint, self.constant, self.fx_node
         )
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, SymNode)
+            and self._expr == other._expr
+            and id(self.shape_env) == id(other.shape_env)
+            and self.pytype == other.pytype
+        )
+
+    def __hash__(self) -> int:
+        return hash((self._expr, self.pytype))
 
     @property
     def expr(self):
@@ -240,6 +251,11 @@ class SymNode:
         return self.str()
 
     def __repr__(self):
+        # NOTE: This seems wrong because it skips a whole lot of information -
+        # but it's used in GraphModule.recompile() when printing out the
+        # pythonic representation of a graph. This seems unfortunate -
+        # GraphModule should probably have its own mechanism for converting
+        # values to representation.
         return self.str()
 
     # These methods call the metaprogrammed methods, they're hand written
@@ -483,6 +499,13 @@ class SymNode:
 
     def is_constant(self):
         return False
+
+    def symbols(self) -> FrozenSet["SymNode"]:
+        return frozenset(
+            SymNode(atom, self.shape_env, self.pytype, None)
+            for atom in self._expr.atoms()
+            if atom.is_symbol
+        )
 
 
 # TODO: this probably needs the sizes-strides eval functions
