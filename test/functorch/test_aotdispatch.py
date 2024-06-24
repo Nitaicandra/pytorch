@@ -5443,6 +5443,59 @@ def forward(self, tangents_1, tangents_2):
         self.assertEqual(a_ref_base.grad.a, a_test_base.grad.a)
         self.assertEqual(a_ref_base.grad.b, a_test_base.grad.b)
 
+    def test_aot_dispatch_output_requires_grad_in_no_grad(self):
+        def fn(x):
+            out1 = x.sin()
+            with torch.enable_grad():
+                out2 = x.cos()
+            return out1, out2
+
+        inp_fns = [
+            lambda: torch.ones(10, requires_grad=True),
+            lambda: torch.ones(10, requires_grad=False),
+        ]
+
+        compiled_f = aot_function(fn, nop)
+        for inp_fn in inp_fns:
+            with torch.no_grad():
+                ref_x = inp_fn()
+                ref_out = fn(ref_x)
+                x = inp_fn()
+                out = compiled_f(x)
+                for r, o in zip(ref_out, out):
+                    self.assertEqual(r.requires_grad, o.requires_grad)
+            if ref_x.requires_grad:
+                with torch.enable_grad():
+                    (ref_out[0] + ref_out[1]).sum().backward()
+                    (out[0] + out[1]).sum().backward()
+                    self.assertEqual(ref_x.grad, x.grad)
+                    assert torch.allclose(ref_x.grad, x.grad, atol=1e-3, rtol=1e-3)
+
+    def test_aot_dispatch_output_requires_grad_in_no_grad_views(self):
+        # view-type ops preserve requires_grad even in no_grad.
+        def fn(x):
+            return x.view(-1), x.sin()
+
+        inference_graph_cell = [None]
+        inference_compiler = make_boxed_compiler(
+            partial(extract_graph, graph_cell=inference_graph_cell)
+        )
+        compiled_fn = aot_function(fn, nop, inference_compiler=inference_compiler)
+
+        inp_x0 = torch.ones(2, 3, requires_grad=True)
+        # Clone in no_grad will make requires_grad=False tensors, keep clone outside of no_grad
+        ref_x0 = inp_x0.clone()
+        x0 = inp_x0.clone()
+        with torch.no_grad():
+            ref_out1, ref_out2 = fn(ref_x0)
+
+            out1, out2 = compiled_fn(x0)
+            # Assert that we executed inference graph
+            self.assertTrue(inference_graph_cell[0] is not None)
+
+            self.assertEqual(ref_out1.requires_grad, out1.requires_grad)
+            self.assertEqual(ref_out2.requires_grad, out2.requires_grad)
+
 
 class TestAOTModuleSimplified(AOTTestCase):
     def test_aot_module_simplified(self):
