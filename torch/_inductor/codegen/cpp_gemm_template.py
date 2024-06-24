@@ -253,6 +253,17 @@ class CppPackedGemmTemplate(CppTemplate):
         def reorder_and_filter(inputs, layout_or_out):
             if _is_int8_gemm(inputs):
                 # No need to reorder for int8 gemm
+                if len(inputs) >= 8:
+                    # Case of QLinear Binary fusion with Bias
+                    assert has_bias is True
+                    inp_idx = input_indices[6]
+                    x2_idx = input_indices[7]
+                    # Move bias at front of x2
+                    return [
+                        *[inputs[idx] for idx in input_indices[:6]],
+                        inputs[inp_idx],
+                        inputs[x2_idx],
+                    ], layout_or_out
                 return inputs, layout_or_out
 
             if has_bias:
