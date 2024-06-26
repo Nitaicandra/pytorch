@@ -44,7 +44,7 @@ namespace at::native {
     TORCH_CHECK(
         (ndims == 2 && input.size(1) != 0) || (ndims == 1 && input.size(0) != 0) || ndims == 0,
         "Expected non-empty vector or matrix with optional 0-dim batch size, but got: ",
-        input.sizes());
+        target.sizes());
 
     if (ndims <= 1) {
       nframe = 1;
@@ -56,7 +56,7 @@ namespace at::native {
 
     TORCH_CHECK(
         target.dim() <= 1 && target.numel() == nframe,
-        "inconsistent target size, expected ", nframe, " but got ",
+        "MultiMarginLoss: The size of input tensor ", nframe, " must match the size of target tensor ",
         target.sizes());
     if (weight && weight->defined()) {
       TORCH_CHECK(
